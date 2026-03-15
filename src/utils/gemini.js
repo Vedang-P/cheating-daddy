@@ -53,15 +53,19 @@ let sessionParams = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY = 2000;
-const TRANSCRIPTION_SEND_DELAY_MS = 1400;
-const MIN_TRANSCRIPTION_CHARS = 16;
-const MIN_TRANSCRIPTION_WORDS = 4;
+const TRANSCRIPTION_SEND_DELAY_MS = 3200;
+const MIN_TRANSCRIPTION_CHARS = 28;
+const MIN_TRANSCRIPTION_WORDS = 6;
 const DUPLICATE_TRANSCRIPTION_WINDOW_MS = 15000;
+const CAPTION_FLUSH_DELAY_MS = 900;
 let transcriptionSendTimer = null;
 let responseRequestInFlight = false;
 let pendingQueuedTranscription = null;
 let lastSentNormalizedTranscription = '';
 let lastSentTranscriptionAt = 0;
+let currentSessionLanguage = 'en-US';
+let latestCaptionText = '';
+let captionFlushTimer = null;
 
 function calculatePcmLevel(pcmBuffer) {
     const sampleCount = Math.floor(pcmBuffer.length / 2);
@@ -89,6 +93,49 @@ function emitPracticeCaption(text) {
         text: text || '',
         timestamp: Date.now(),
     });
+}
+
+function clearCaptionFlushTimer() {
+    if (captionFlushTimer) {
+        clearTimeout(captionFlushTimer);
+        captionFlushTimer = null;
+    }
+}
+
+function countMatchingChars(text, regex) {
+    const matches = text.match(regex);
+    return matches ? matches.length : 0;
+}
+
+function isCaptionTextAllowed(text) {
+    const normalized = normalizeWhitespace(text);
+    if (!normalized) return false;
+
+    if (currentSessionLanguage.startsWith('en')) {
+        const latinChars = countMatchingChars(normalized, /[A-Za-z]/g);
+        const devanagariChars = countMatchingChars(normalized, /[\u0900-\u097F]/g);
+
+        if (devanagariChars > 0 && devanagariChars > latinChars) {
+            console.log('Ignoring non-English caption candidate during English session:', normalized);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+function schedulePracticeCaptionFlush(text) {
+    const normalized = normalizeWhitespace(text);
+    if (!normalized || !isCaptionTextAllowed(normalized)) {
+        return;
+    }
+
+    latestCaptionText = normalized;
+    clearCaptionFlushTimer();
+    captionFlushTimer = setTimeout(() => {
+        captionFlushTimer = null;
+        emitPracticeCaption(latestCaptionText);
+    }, CAPTION_FLUSH_DELAY_MS);
 }
 
 function normalizeWhitespace(text) {
@@ -230,6 +277,8 @@ function initializeNewSession(profile = null, customPrompt = null) {
     pendingQueuedTranscription = null;
     lastSentNormalizedTranscription = '';
     lastSentTranscriptionAt = 0;
+    latestCaptionText = '';
+    clearCaptionFlushTimer();
     emitPracticeCaption('');
     console.log('New conversation session started:', currentSessionId, 'profile:', profile);
 
@@ -590,6 +639,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         sessionParams = { apiKey, customPrompt, profile, language };
         reconnectAttempts = 0;
     }
+    currentSessionLanguage = language;
 
     const client = new GoogleGenAI({
         vertexai: false,
@@ -623,12 +673,14 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     if (message.serverContent?.inputTranscription?.results) {
                         const transcriptBlock = formatSpeakerResults(message.serverContent.inputTranscription.results);
                         currentTranscription = mergeTranscriptSnapshots(currentTranscription, transcriptBlock);
-                        emitPracticeCaption(extractCaptionTextFromResults(message.serverContent.inputTranscription.results));
+                        clearTranscriptionSendTimer();
+                        schedulePracticeCaptionFlush(extractCaptionTextFromResults(message.serverContent.inputTranscription.results));
                     } else if (message.serverContent?.inputTranscription?.text) {
                         const text = message.serverContent.inputTranscription.text;
                         if (text.trim() !== '') {
                             currentTranscription = mergeTranscriptSnapshots(currentTranscription, text);
-                            emitPracticeCaption(text.trim());
+                            clearTranscriptionSendTimer();
+                            schedulePracticeCaptionFlush(text.trim());
                         }
                     }
 
@@ -711,6 +763,7 @@ async function attemptReconnect() {
     messageBuffer = '';
     currentTranscription = '';
     clearTranscriptionSendTimer();
+    clearCaptionFlushTimer();
     // Don't reset groqConversationHistory to preserve context across reconnects
 
     sendToRenderer('update-status', `Reconnecting... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
@@ -1217,6 +1270,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             if (currentProviderMode === 'cloud') {
                 closeCloud();
                 currentProviderMode = 'byok';
+                clearCaptionFlushTimer();
                 emitPracticeCaption('');
                 return { success: true };
             }
@@ -1224,6 +1278,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             if (currentProviderMode === 'local') {
                 getLocalAi().closeLocalSession();
                 currentProviderMode = 'byok';
+                clearCaptionFlushTimer();
                 emitPracticeCaption('');
                 return { success: true };
             }
@@ -1239,6 +1294,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             }
 
             clearTranscriptionSendTimer();
+            clearCaptionFlushTimer();
             currentTranscription = '';
             emitPracticeCaption('');
 
