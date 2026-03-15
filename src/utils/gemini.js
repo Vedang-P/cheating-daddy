@@ -53,6 +53,15 @@ let sessionParams = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY = 2000;
+const TRANSCRIPTION_SEND_DELAY_MS = 1400;
+const MIN_TRANSCRIPTION_CHARS = 16;
+const MIN_TRANSCRIPTION_WORDS = 4;
+const DUPLICATE_TRANSCRIPTION_WINDOW_MS = 15000;
+let transcriptionSendTimer = null;
+let responseRequestInFlight = false;
+let pendingQueuedTranscription = null;
+let lastSentNormalizedTranscription = '';
+let lastSentTranscriptionAt = 0;
 
 function calculatePcmLevel(pcmBuffer) {
     const sampleCount = Math.floor(pcmBuffer.length / 2);
@@ -73,6 +82,124 @@ function sendToRenderer(channel, data) {
     if (windows.length > 0) {
         windows[0].webContents.send(channel, data);
     }
+}
+
+function emitPracticeCaption(text) {
+    sendToRenderer('practice-caption', {
+        text: text || '',
+        timestamp: Date.now(),
+    });
+}
+
+function normalizeWhitespace(text) {
+    return (text || '').replace(/\s+/g, ' ').trim();
+}
+
+function mergeTranscriptSnapshots(previous, incoming) {
+    const prev = (previous || '').trim();
+    const next = (incoming || '').trim();
+
+    if (!next) return prev;
+    if (!prev) return next;
+
+    const normalizedPrev = normalizeWhitespace(prev);
+    const normalizedNext = normalizeWhitespace(next);
+
+    if (normalizedNext === normalizedPrev) return prev;
+    if (normalizedNext.length >= normalizedPrev.length && normalizedNext.includes(normalizedPrev)) return next;
+    if (normalizedPrev.length > normalizedNext.length && normalizedPrev.includes(normalizedNext)) return prev;
+
+    return `${prev}\n${next}`;
+}
+
+function extractCaptionTextFromResults(results) {
+    const interviewerLines = results
+        .filter(result => result?.transcript && result.speakerId === 1)
+        .map(result => result.transcript.trim())
+        .filter(Boolean);
+
+    if (interviewerLines.length > 0) {
+        return interviewerLines.join(' ');
+    }
+
+    return results
+        .map(result => result?.transcript?.trim())
+        .filter(Boolean)
+        .join(' ');
+}
+
+function clearTranscriptionSendTimer() {
+    if (transcriptionSendTimer) {
+        clearTimeout(transcriptionSendTimer);
+        transcriptionSendTimer = null;
+    }
+}
+
+function shouldSendTranscription(transcription) {
+    const normalized = normalizeWhitespace(transcription);
+    const wordCount = normalized ? normalized.split(' ').length : 0;
+
+    if (!normalized) return false;
+    if (normalized.length < MIN_TRANSCRIPTION_CHARS && wordCount < MIN_TRANSCRIPTION_WORDS) {
+        console.log('Skipping short transcription:', normalized);
+        return false;
+    }
+
+    const now = Date.now();
+    if (normalized === lastSentNormalizedTranscription && now - lastSentTranscriptionAt < DUPLICATE_TRANSCRIPTION_WINDOW_MS) {
+        console.log('Skipping duplicate transcription:', normalized);
+        return false;
+    }
+
+    return true;
+}
+
+async function dispatchTranscriptForResponse(transcription) {
+    if (responseRequestInFlight) {
+        pendingQueuedTranscription = transcription;
+        return;
+    }
+
+    responseRequestInFlight = true;
+    sendToRenderer('update-status', 'Generating response...');
+
+    try {
+        if (hasGroqKey()) {
+            await sendToGroq(transcription);
+        } else {
+            await sendToGemma(transcription);
+        }
+    } finally {
+        responseRequestInFlight = false;
+
+        if (pendingQueuedTranscription && pendingQueuedTranscription !== transcription) {
+            const queued = pendingQueuedTranscription;
+            pendingQueuedTranscription = null;
+            await dispatchTranscriptForResponse(queued);
+        } else {
+            pendingQueuedTranscription = null;
+        }
+    }
+}
+
+function queueTranscriptForResponse(reason = 'turn-complete') {
+    clearTranscriptionSendTimer();
+    transcriptionSendTimer = setTimeout(async () => {
+        transcriptionSendTimer = null;
+
+        const transcription = currentTranscription.trim();
+        currentTranscription = '';
+
+        if (!shouldSendTranscription(transcription)) {
+            sendToRenderer('update-status', 'Listening...');
+            return;
+        }
+
+        lastSentNormalizedTranscription = normalizeWhitespace(transcription);
+        lastSentTranscriptionAt = Date.now();
+        console.log(`Dispatching transcription after ${reason}:`, transcription.substring(0, 120));
+        await dispatchTranscriptForResponse(transcription);
+    }, TRANSCRIPTION_SEND_DELAY_MS);
 }
 
 // Build context message for session restoration
@@ -98,6 +225,12 @@ function initializeNewSession(profile = null, customPrompt = null) {
     groqConversationHistory = [];
     currentProfile = profile;
     currentCustomPrompt = customPrompt;
+    clearTranscriptionSendTimer();
+    responseRequestInFlight = false;
+    pendingQueuedTranscription = null;
+    lastSentNormalizedTranscription = '';
+    lastSentTranscriptionAt = 0;
+    emitPracticeCaption('');
     console.log('New conversation session started:', currentSessionId, 'profile:', profile);
 
     // Save initial session with profile context
@@ -488,11 +621,14 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
 
                     // Handle input transcription (what was spoken)
                     if (message.serverContent?.inputTranscription?.results) {
-                        currentTranscription += formatSpeakerResults(message.serverContent.inputTranscription.results);
+                        const transcriptBlock = formatSpeakerResults(message.serverContent.inputTranscription.results);
+                        currentTranscription = mergeTranscriptSnapshots(currentTranscription, transcriptBlock);
+                        emitPracticeCaption(extractCaptionTextFromResults(message.serverContent.inputTranscription.results));
                     } else if (message.serverContent?.inputTranscription?.text) {
                         const text = message.serverContent.inputTranscription.text;
                         if (text.trim() !== '') {
-                            currentTranscription += text;
+                            currentTranscription = mergeTranscriptSnapshots(currentTranscription, text);
+                            emitPracticeCaption(text.trim());
                         }
                     }
 
@@ -501,17 +637,13 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
 
                     if (message.serverContent?.generationComplete) {
                         if (currentTranscription.trim() !== '') {
-                            if (hasGroqKey()) {
-                                sendToGroq(currentTranscription);
-                            } else {
-                                sendToGemma(currentTranscription);
-                            }
-                            currentTranscription = '';
+                            queueTranscriptForResponse('generation-complete');
                         }
                         messageBuffer = '';
                     }
 
                     if (message.serverContent?.turnComplete) {
+                        queueTranscriptForResponse('turn-complete');
                         sendToRenderer('update-status', 'Listening...');
                     }
                 },
@@ -578,6 +710,7 @@ async function attemptReconnect() {
     // Clear stale buffers
     messageBuffer = '';
     currentTranscription = '';
+    clearTranscriptionSendTimer();
     // Don't reset groqConversationHistory to preserve context across reconnects
 
     sendToRenderer('update-status', `Reconnecting... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
@@ -1084,12 +1217,14 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             if (currentProviderMode === 'cloud') {
                 closeCloud();
                 currentProviderMode = 'byok';
+                emitPracticeCaption('');
                 return { success: true };
             }
 
             if (currentProviderMode === 'local') {
                 getLocalAi().closeLocalSession();
                 currentProviderMode = 'byok';
+                emitPracticeCaption('');
                 return { success: true };
             }
 
@@ -1102,6 +1237,10 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
                 await geminiSessionRef.current.close();
                 geminiSessionRef.current = null;
             }
+
+            clearTranscriptionSendTimer();
+            currentTranscription = '';
+            emitPracticeCaption('');
 
             return { success: true };
         } catch (error) {

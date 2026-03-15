@@ -95,6 +95,10 @@ function handleMessage(msg) {
         case 'transcription':
             console.log('[Cloud] Transcription:', msg.text);
             currentTranscription = msg.text || '';
+            sendToRenderer('practice-caption', {
+                text: currentTranscription,
+                timestamp: Date.now(),
+            });
             sendToRenderer('update-status', 'Generating response...');
             break;
 
@@ -114,6 +118,10 @@ function handleMessage(msg) {
                 onTurnComplete(currentTranscription, currentCloudResponse);
             }
             currentTranscription = '';
+            sendToRenderer('practice-caption', {
+                text: '',
+                timestamp: Date.now(),
+            });
             sendToRenderer('update-status', 'Listening...');
             break;
 
@@ -186,6 +194,10 @@ function closeCloud() {
     isFirstChunk = true;
     audioChunkCount = 0;
     onTurnComplete = null;
+    sendToRenderer('practice-caption', {
+        text: '',
+        timestamp: Date.now(),
+    });
 }
 
 function isCloudActive() {
