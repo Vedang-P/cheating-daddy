@@ -216,6 +216,77 @@ export class AssistantView extends LitElement {
             background: var(--bg-app);
         }
 
+        .audio-meter {
+            display: flex;
+            align-items: center;
+            gap: var(--space-sm);
+            padding: 0 var(--space-md) var(--space-md) var(--space-md);
+            background: var(--bg-app);
+        }
+
+        .audio-meter-label {
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+            font-family: var(--font-mono);
+            width: 72px;
+            flex-shrink: 0;
+        }
+
+        .audio-meter-bars {
+            display: flex;
+            align-items: flex-end;
+            gap: 4px;
+            height: 22px;
+            flex: 1;
+            padding: 0 2px;
+        }
+
+        .audio-meter-bar {
+            flex: 1;
+            min-width: 4px;
+            border-radius: 999px;
+            background: var(--bg-elevated);
+            transition: height 90ms linear, background 90ms linear, opacity 120ms linear;
+            opacity: 0.8;
+        }
+
+        .audio-meter-bar.active {
+            background: var(--accent);
+            opacity: 1;
+        }
+
+        .practice-captions {
+            margin: 0 var(--space-md) var(--space-md) var(--space-md);
+            padding: var(--space-sm) var(--space-md);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            background: var(--bg-surface);
+            color: var(--text-primary);
+        }
+
+        .practice-captions-label {
+            display: block;
+            margin-bottom: 4px;
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+            font-family: var(--font-mono);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .practice-captions-text {
+            min-height: 1.5em;
+            font-size: var(--font-size-sm);
+            line-height: 1.45;
+            word-break: break-word;
+            user-select: text;
+            cursor: text;
+        }
+
+        .practice-captions-placeholder {
+            color: var(--text-muted);
+        }
+
         .input-bar-inner {
             display: flex;
             align-items: center;
@@ -307,6 +378,9 @@ export class AssistantView extends LitElement {
         onSendText: { type: Function },
         shouldAnimateResponse: { type: Boolean },
         isAnalyzing: { type: Boolean, state: true },
+        audioLevels: { type: Array, state: true },
+        practiceCaptionsEnabled: { type: Boolean, state: true },
+        liveCaptionText: { type: String, state: true },
     };
 
     constructor() {
@@ -317,6 +391,12 @@ export class AssistantView extends LitElement {
         this.onSendText = () => {};
         this.isAnalyzing = false;
         this._animFrame = null;
+        this._analyzeTimeout = null;
+        this.audioLevels = Array(24).fill(0.04);
+        this._audioDecayFrame = null;
+        this.practiceCaptionsEnabled = false;
+        this.liveCaptionText = '';
+        this._captionClearTimeout = null;
     }
 
     getProfileNames() {
@@ -426,6 +506,7 @@ export class AssistantView extends LitElement {
 
     connectedCallback() {
         super.connectedCallback();
+        this._loadPracticeCaptionPreference();
 
         if (window.require) {
             const { ipcRenderer } = window.require('electron');
@@ -434,17 +515,29 @@ export class AssistantView extends LitElement {
             this.handleNextResponse = () => this.navigateToNextResponse();
             this.handleScrollUp = () => this.scrollResponseUp();
             this.handleScrollDown = () => this.scrollResponseDown();
+            this.handleSystemAudioLevel = (_, payload) => this._ingestAudioLevel(payload?.level ?? 0);
+            this.handlePracticeCaption = (_, payload) => this._updatePracticeCaption(payload?.text ?? '');
 
             ipcRenderer.on('navigate-previous-response', this.handlePreviousResponse);
             ipcRenderer.on('navigate-next-response', this.handleNextResponse);
             ipcRenderer.on('scroll-response-up', this.handleScrollUp);
             ipcRenderer.on('scroll-response-down', this.handleScrollDown);
+            ipcRenderer.on('system-audio-level', this.handleSystemAudioLevel);
+            ipcRenderer.on('practice-caption', this.handlePracticeCaption);
         }
+
+        this.handleManualScreenshotComplete = () => this._finishAnalyze();
+        this.handleWindowAudioLevel = event => this._ingestAudioLevel(event.detail?.level ?? 0);
+        window.addEventListener('manual-screenshot-complete', this.handleManualScreenshotComplete);
+        window.addEventListener('system-audio-level', this.handleWindowAudioLevel);
+        this._startAudioDecay();
     }
 
     disconnectedCallback() {
         super.disconnectedCallback();
         this._stopWaveformAnimation();
+        this._clearAnalyzeTimeout();
+        this._stopAudioDecay();
 
         if (window.require) {
             const { ipcRenderer } = window.require('electron');
@@ -452,6 +545,29 @@ export class AssistantView extends LitElement {
             if (this.handleNextResponse) ipcRenderer.removeListener('navigate-next-response', this.handleNextResponse);
             if (this.handleScrollUp) ipcRenderer.removeListener('scroll-response-up', this.handleScrollUp);
             if (this.handleScrollDown) ipcRenderer.removeListener('scroll-response-down', this.handleScrollDown);
+            if (this.handleSystemAudioLevel) ipcRenderer.removeListener('system-audio-level', this.handleSystemAudioLevel);
+            if (this.handlePracticeCaption) ipcRenderer.removeListener('practice-caption', this.handlePracticeCaption);
+        }
+
+        if (this.handleManualScreenshotComplete) {
+            window.removeEventListener('manual-screenshot-complete', this.handleManualScreenshotComplete);
+        }
+        if (this.handleWindowAudioLevel) {
+            window.removeEventListener('system-audio-level', this.handleWindowAudioLevel);
+        }
+        if (this._captionClearTimeout) {
+            clearTimeout(this._captionClearTimeout);
+            this._captionClearTimeout = null;
+        }
+    }
+
+    async _loadPracticeCaptionPreference() {
+        try {
+            const prefs = await cheatingDaddy.storage.getPreferences();
+            this.practiceCaptionsEnabled = prefs.practiceCaptionsEnabled ?? false;
+            this.requestUpdate();
+        } catch (error) {
+            console.error('Failed to load practice caption preference:', error);
         }
     }
 
@@ -476,8 +592,77 @@ export class AssistantView extends LitElement {
         if (window.captureManualScreenshot) {
             this.isAnalyzing = true;
             this._responseCountWhenStarted = this.responses.length;
-            window.captureManualScreenshot();
+            this._clearAnalyzeTimeout();
+            this._analyzeTimeout = setTimeout(() => {
+                if (this.isAnalyzing) {
+                    this._finishAnalyze();
+                }
+            }, 30000);
+            try {
+                await window.captureManualScreenshot();
+            } catch (error) {
+                console.error('Manual screenshot failed:', error);
+                this._finishAnalyze();
+            }
         }
+    }
+
+    _clearAnalyzeTimeout() {
+        if (this._analyzeTimeout) {
+            clearTimeout(this._analyzeTimeout);
+            this._analyzeTimeout = null;
+        }
+    }
+
+    _finishAnalyze() {
+        this._clearAnalyzeTimeout();
+        if (this.isAnalyzing) {
+            this.isAnalyzing = false;
+            this.requestUpdate();
+        }
+    }
+
+    _ingestAudioLevel(level) {
+        const normalized = Math.max(0.04, Math.min(1, level || 0));
+        this.audioLevels = [...this.audioLevels.slice(1), normalized];
+        this.requestUpdate();
+    }
+
+    _startAudioDecay() {
+        if (this._audioDecayFrame) return;
+
+        const tick = () => {
+            this.audioLevels = this.audioLevels.map(level => Math.max(0.04, level * 0.92));
+            this._audioDecayFrame = requestAnimationFrame(tick);
+        };
+
+        this._audioDecayFrame = requestAnimationFrame(tick);
+    }
+
+    _stopAudioDecay() {
+        if (this._audioDecayFrame) {
+            cancelAnimationFrame(this._audioDecayFrame);
+            this._audioDecayFrame = null;
+        }
+    }
+
+    _updatePracticeCaption(text) {
+        if (!this.practiceCaptionsEnabled) return;
+
+        this.liveCaptionText = text || '';
+        if (this._captionClearTimeout) {
+            clearTimeout(this._captionClearTimeout);
+            this._captionClearTimeout = null;
+        }
+
+        if (this.liveCaptionText) {
+            this._captionClearTimeout = setTimeout(() => {
+                this.liveCaptionText = '';
+                this.requestUpdate();
+            }, 8000);
+        }
+
+        this.requestUpdate();
     }
 
     _startWaveformAnimation() {
@@ -647,7 +832,7 @@ export class AssistantView extends LitElement {
 
         if (changedProperties.has('responses') && this.isAnalyzing) {
             if (this.responses.length > this._responseCountWhenStarted) {
-                this.isAnalyzing = false;
+                this._finishAnalyze();
             }
         }
     }
@@ -705,6 +890,26 @@ export class AssistantView extends LitElement {
                     </span>
                 </button>
             </div>
+
+            <div class="audio-meter">
+                <span class="audio-meter-label">system audio</span>
+                <div class="audio-meter-bars">
+                    ${this.audioLevels.map(level => {
+                        const height = `${Math.max(3, Math.round(level * 100))}%`;
+                        const active = level > 0.12;
+                        return html`<span class="audio-meter-bar ${active ? 'active' : ''}" style=${`height:${height}`}></span>`;
+                    })}
+                </div>
+            </div>
+
+            ${this.practiceCaptionsEnabled ? html`
+                <div class="practice-captions">
+                    <span class="practice-captions-label">practice captions</span>
+                    <div class="practice-captions-text">
+                        ${this.liveCaptionText || html`<span class="practice-captions-placeholder">Waiting for transcribed speech...</span>`}
+                    </div>
+                </div>
+            ` : ''}
         `;
     }
 }

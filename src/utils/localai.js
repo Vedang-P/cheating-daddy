@@ -17,6 +17,7 @@ let isSpeaking = false;
 let speechBuffers = [];
 let silenceFrameCount = 0;
 let speechFrameCount = 0;
+let recentAudioFrames = [];
 
 // VAD configuration
 const VAD_MODES = {
@@ -25,7 +26,8 @@ const VAD_MODES = {
     AGGRESSIVE: { energyThreshold: 0.015, speechFramesRequired: 2, silenceFramesRequired: 20 },
     VERY_AGGRESSIVE: { energyThreshold: 0.02, speechFramesRequired: 2, silenceFramesRequired: 15 },
 };
-let vadConfig = VAD_MODES.VERY_AGGRESSIVE;
+const PREROLL_FRAME_LIMIT = 8;
+let vadConfig = VAD_MODES.LOW_BITRATE;
 
 // Audio resampling buffer
 let resampleRemainder = Buffer.alloc(0);
@@ -75,7 +77,13 @@ function calculateRMS(pcm16Buffer) {
 
 function processVAD(pcm16kBuffer) {
     const rms = calculateRMS(pcm16kBuffer);
-    const isVoice = rms > vadConfig.energyThreshold;
+    const speechThreshold = isSpeaking ? vadConfig.energyThreshold * 0.55 : vadConfig.energyThreshold;
+    const isVoice = rms > speechThreshold;
+
+    recentAudioFrames.push(Buffer.from(pcm16kBuffer));
+    if (recentAudioFrames.length > PREROLL_FRAME_LIMIT) {
+        recentAudioFrames.shift();
+    }
 
     if (isVoice) {
         speechFrameCount++;
@@ -83,7 +91,7 @@ function processVAD(pcm16kBuffer) {
 
         if (!isSpeaking && speechFrameCount >= vadConfig.speechFramesRequired) {
             isSpeaking = true;
-            speechBuffers = [];
+            speechBuffers = recentAudioFrames.map(frame => Buffer.from(frame));
             console.log('[LocalAI] Speech started (RMS:', rms.toFixed(4), ')');
             sendToRenderer('update-status', 'Listening... (speech detected)');
         }
@@ -99,6 +107,7 @@ function processVAD(pcm16kBuffer) {
             // Trigger transcription with accumulated audio
             const audioData = Buffer.concat(speechBuffers);
             speechBuffers = [];
+            recentAudioFrames = [];
             handleSpeechEnd(audioData);
             return;
         }
@@ -199,6 +208,10 @@ async function handleSpeechEnd(audioData) {
         return;
     }
 
+    sendToRenderer('practice-caption', {
+        text: transcription.trim(),
+        timestamp: Date.now(),
+    });
     sendToRenderer('update-status', 'Generating response...');
     await sendToOllama(transcription);
 }
@@ -303,12 +316,14 @@ async function initializeLocalSession(ollamaHost, model, whisperModel, profile, 
         silenceFrameCount = 0;
         speechFrameCount = 0;
         resampleRemainder = Buffer.alloc(0);
+        recentAudioFrames = [];
         localConversationHistory = [];
 
         // Initialize conversation session
         initializeNewSession(profile, customPrompt);
 
         isLocalActive = true;
+        sendToRenderer('practice-caption', { text: '', timestamp: Date.now() });
         sendToRenderer('session-initializing', false);
         sendToRenderer('update-status', 'Local AI ready - Listening...');
 
@@ -340,10 +355,12 @@ function closeLocalSession() {
     silenceFrameCount = 0;
     speechFrameCount = 0;
     resampleRemainder = Buffer.alloc(0);
+    recentAudioFrames = [];
     localConversationHistory = [];
     ollamaClient = null;
     ollamaModel = null;
     currentSystemPrompt = null;
+    sendToRenderer('practice-caption', { text: '', timestamp: Date.now() });
     // Note: whisperPipeline is kept loaded to avoid reloading on next session
 }
 

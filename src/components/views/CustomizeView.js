@@ -214,6 +214,7 @@ export class CustomizeView extends LitElement {
         this.backgroundTransparency = 0.8;
         this.fontSize = 20;
         this.audioMode = 'speaker_only';
+        this.practiceCaptionsEnabled = false;
         this.customPrompt = '';
         this.theme = 'dark';
         this._loadFromStorage();
@@ -230,6 +231,7 @@ export class CustomizeView extends LitElement {
             this.backgroundTransparency = prefs.backgroundTransparency ?? 0.8;
             this.fontSize = prefs.fontSize ?? 20;
             this.audioMode = prefs.audioMode ?? 'speaker_only';
+            this.practiceCaptionsEnabled = prefs.practiceCaptionsEnabled ?? false;
             this.customPrompt = prefs.customPrompt ?? '';
             this.theme = prefs.theme ?? 'dark';
             if (keybinds) {
@@ -361,6 +363,12 @@ export class CustomizeView extends LitElement {
         this.requestUpdate();
     }
 
+    async handlePracticeCaptionsChange(e) {
+        this.practiceCaptionsEnabled = e.target.checked;
+        await cheatingDaddy.storage.updatePreference('practiceCaptionsEnabled', this.practiceCaptionsEnabled);
+        this.requestUpdate();
+    }
+
     async handleThemeChange(e) {
         this.theme = e.target.value;
         await cheatingDaddy.theme.save(this.theme);
@@ -486,6 +494,7 @@ export class CustomizeView extends LitElement {
                 selectedScreenshotInterval: '5',
                 selectedImageQuality: 'medium',
                 audioMode: 'speaker_only',
+                practiceCaptionsEnabled: false,
                 fontSize: 20,
                 backgroundTransparency: 0.8,
                 googleSearchEnabled: false,
@@ -508,6 +517,7 @@ export class CustomizeView extends LitElement {
             this.selectedLanguage = defaults.selectedLanguage;
             this.selectedImageQuality = defaults.selectedImageQuality;
             this.audioMode = defaults.audioMode;
+            this.practiceCaptionsEnabled = defaults.practiceCaptionsEnabled;
             this.fontSize = defaults.fontSize;
             this.backgroundTransparency = defaults.backgroundTransparency;
             this.googleSearchEnabled = defaults.googleSearchEnabled;
@@ -583,6 +593,15 @@ export class CustomizeView extends LitElement {
                     ${this.audioMode !== 'speaker_only' ? html`
                         <div class="warning-callout">May cause unexpected behavior. Only change this if you know what you're doing.</div>
                     ` : ''}
+                    <label class="toggle-row">
+                        <input
+                            class="toggle-input"
+                            type="checkbox"
+                            .checked=${this.practiceCaptionsEnabled}
+                            @change=${this.handlePracticeCaptionsChange}
+                        />
+                        <span class="toggle-label">Show practice captions inside live window</span>
+                    </label>
                     <div class="form-group">
                         <label class="form-label">Image Quality</label>
                         <select class="control" .value=${this.selectedImageQuality} @change=${this.handleImageQualitySelect}>

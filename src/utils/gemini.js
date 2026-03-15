@@ -54,6 +54,20 @@ let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY = 2000;
 
+function calculatePcmLevel(pcmBuffer) {
+    const sampleCount = Math.floor(pcmBuffer.length / 2);
+    if (sampleCount === 0) return 0;
+
+    let sumSquares = 0;
+    for (let i = 0; i < sampleCount; i++) {
+        const sample = pcmBuffer.readInt16LE(i * 2) / 32768;
+        sumSquares += sample * sample;
+    }
+
+    const rms = Math.sqrt(sumSquares / sampleCount);
+    return Math.max(0, Math.min(1, rms * 6));
+}
+
 function sendToRenderer(channel, data) {
     const windows = BrowserWindow.getAllWindows();
     if (windows.length > 0) {
@@ -701,6 +715,10 @@ async function startMacOSAudioCapture(geminiSessionRef) {
             audioBuffer = audioBuffer.slice(CHUNK_SIZE);
 
             const monoChunk = CHANNELS === 2 ? convertStereoToMono(chunk) : chunk;
+            sendToRenderer('system-audio-level', {
+                level: calculatePcmLevel(monoChunk),
+                source: 'system',
+            });
 
             if (currentProviderMode === 'cloud') {
                 sendCloudAudio(monoChunk);
@@ -746,7 +764,9 @@ function convertStereoToMono(stereoBuffer) {
 
     for (let i = 0; i < samples; i++) {
         const leftSample = stereoBuffer.readInt16LE(i * 4);
-        monoBuffer.writeInt16LE(leftSample, i * 2);
+        const rightSample = stereoBuffer.readInt16LE(i * 4 + 2);
+        const mixedSample = Math.round((leftSample + rightSample) / 2);
+        monoBuffer.writeInt16LE(mixedSample, i * 2);
     }
 
     return monoBuffer;
@@ -758,6 +778,10 @@ function stopMacOSAudioCapture() {
         systemAudioProc.kill('SIGTERM');
         systemAudioProc = null;
     }
+    sendToRenderer('system-audio-level', {
+        level: 0,
+        source: 'system',
+    });
 }
 
 async function sendAudioToGemini(base64Data, geminiSessionRef) {

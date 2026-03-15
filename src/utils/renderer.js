@@ -140,6 +140,30 @@ function arrayBufferToBase64(buffer) {
     return btoa(binary);
 }
 
+function emitSystemAudioLevel(level, source = 'system') {
+    window.dispatchEvent(
+        new CustomEvent('system-audio-level', {
+            detail: {
+                level: Math.max(0, Math.min(1, level)),
+                source,
+            },
+        })
+    );
+}
+
+function calculateFloatAudioLevel(float32Array) {
+    if (!float32Array || float32Array.length === 0) return 0;
+
+    let sumSquares = 0;
+    for (let i = 0; i < float32Array.length; i++) {
+        const sample = Math.max(-1, Math.min(1, float32Array[i]));
+        sumSquares += sample * sample;
+    }
+
+    const rms = Math.sqrt(sumSquares / float32Array.length);
+    return Math.max(0, Math.min(1, rms * 6));
+}
+
 async function initializeGemini(profile = 'interview', language = 'en-US') {
     const apiKey = await storage.getApiKey();
     if (apiKey) {
@@ -409,6 +433,7 @@ function setupLinuxSystemAudioProcessing() {
 
     audioProcessor.onaudioprocess = async e => {
         const inputData = e.inputBuffer.getChannelData(0);
+        emitSystemAudioLevel(calculateFloatAudioLevel(inputData), 'system');
         audioBuffer.push(...inputData);
 
         // Process audio in chunks
@@ -439,6 +464,7 @@ function setupWindowsLoopbackProcessing() {
 
     audioProcessor.onaudioprocess = async e => {
         const inputData = e.inputBuffer.getChannelData(0);
+        emitSystemAudioLevel(calculateFloatAudioLevel(inputData), 'system');
         audioBuffer.push(...inputData);
 
         // Process audio in chunks
@@ -555,12 +581,21 @@ So if its a code question, give me the approach in few bullet points, then the e
 If its a question about the website, give me the answer no bs, complete answer.
 If its a mcq question, give me the answer no bs, complete answer.`;
 
+function emitManualScreenshotComplete(success, error = null) {
+    window.dispatchEvent(
+        new CustomEvent('manual-screenshot-complete', {
+            detail: { success, error },
+        })
+    );
+}
+
 async function captureManualScreenshot(imageQuality = null) {
     console.log('Manual screenshot triggered');
     const quality = imageQuality || currentImageQuality;
 
     if (!mediaStream) {
         console.error('No media stream available');
+        emitManualScreenshotComplete(false, 'No media stream available');
         return;
     }
 
@@ -587,6 +622,7 @@ async function captureManualScreenshot(imageQuality = null) {
     // Check if video is ready
     if (hiddenVideo.readyState < 2) {
         console.warn('Video not ready yet, skipping screenshot');
+        emitManualScreenshotComplete(false, 'Video not ready yet');
         return;
     }
 
@@ -623,33 +659,47 @@ async function captureManualScreenshot(imageQuality = null) {
         async blob => {
             if (!blob) {
                 console.error('Failed to create blob from canvas');
+                emitManualScreenshotComplete(false, 'Failed to create image blob');
                 return;
             }
 
             const reader = new FileReader();
             reader.onloadend = async () => {
-                const base64data = reader.result.split(',')[1];
+                const base64data = reader.result?.split(',')[1];
 
                 if (!base64data || base64data.length < 100) {
                     console.error('Invalid base64 data generated');
+                    emitManualScreenshotComplete(false, 'Invalid image data generated');
                     return;
                 }
 
                 console.log(`Sending image: ${destW}x${destH}, ~${Math.round(base64data.length / 1024)}KB`);
 
-                // Send image with prompt to HTTP API (response streams via IPC events)
-                const result = await ipcRenderer.invoke('send-image-content', {
-                    data: base64data,
-                    prompt: MANUAL_SCREENSHOT_PROMPT,
-                });
+                try {
+                    // Send image with prompt to HTTP API (response streams via IPC events)
+                    const result = await ipcRenderer.invoke('send-image-content', {
+                        data: base64data,
+                        prompt: MANUAL_SCREENSHOT_PROMPT,
+                    });
 
-                if (result.success) {
-                    console.log(`Image response completed from ${result.model}`);
-                    // Response already displayed via streaming events (new-response/update-response)
-                } else {
-                    console.error('Failed to get image response:', result.error);
-                    cheatingDaddy.addNewResponse(`Error: ${result.error}`);
+                    if (result.success) {
+                        console.log(`Image response completed from ${result.model}`);
+                        emitManualScreenshotComplete(true);
+                        // Response already displayed via streaming events (new-response/update-response)
+                    } else {
+                        console.error('Failed to get image response:', result.error);
+                        cheatingDaddy.addNewResponse(`Error: ${result.error}`);
+                        emitManualScreenshotComplete(false, result.error);
+                    }
+                } catch (error) {
+                    console.error('Error invoking image analysis:', error);
+                    cheatingDaddy.addNewResponse(`Error: ${error.message}`);
+                    emitManualScreenshotComplete(false, error.message);
                 }
+            };
+            reader.onerror = () => {
+                console.error('Failed to read screenshot blob');
+                emitManualScreenshotComplete(false, 'Failed to read screenshot');
             };
             reader.readAsDataURL(blob);
         },
@@ -687,6 +737,8 @@ function stopCapture() {
         mediaStream.getTracks().forEach(track => track.stop());
         mediaStream = null;
     }
+
+    emitSystemAudioLevel(0, 'system');
 
     // Stop macOS audio capture if running
     if (isMacOS) {
