@@ -53,11 +53,11 @@ let sessionParams = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY = 2000;
-const TRANSCRIPTION_SEND_DELAY_MS = 3200;
-const MIN_TRANSCRIPTION_CHARS = 28;
-const MIN_TRANSCRIPTION_WORDS = 6;
+const TRANSCRIPTION_SEND_DELAY_MS = 1600;
+const MIN_TRANSCRIPTION_CHARS = 10;
+const MIN_TRANSCRIPTION_WORDS = 2;
 const DUPLICATE_TRANSCRIPTION_WINDOW_MS = 15000;
-const CAPTION_FLUSH_DELAY_MS = 900;
+const CAPTION_FLUSH_DELAY_MS = 300;
 let transcriptionSendTimer = null;
 let responseRequestInFlight = false;
 let pendingQueuedTranscription = null;
@@ -130,7 +130,7 @@ function schedulePracticeCaptionFlush(text) {
         return;
     }
 
-    latestCaptionText = normalized;
+    latestCaptionText = mergeTranscriptSnapshots(latestCaptionText, normalized);
     clearCaptionFlushTimer();
     captionFlushTimer = setTimeout(() => {
         captionFlushTimer = null;
@@ -160,18 +160,10 @@ function mergeTranscriptSnapshots(previous, incoming) {
 }
 
 function extractCaptionTextFromResults(results) {
-    const interviewerLines = results
-        .filter(result => result?.transcript && result.speakerId === 1)
-        .map(result => result.transcript.trim())
-        .filter(Boolean);
-
-    if (interviewerLines.length > 0) {
-        return interviewerLines.join(' ');
-    }
-
     return results
         .map(result => result?.transcript?.trim())
         .filter(Boolean)
+        .filter((text, index, arr) => arr.indexOf(text) === index)
         .join(' ');
 }
 
@@ -236,6 +228,7 @@ function queueTranscriptForResponse(reason = 'turn-complete') {
 
         const transcription = currentTranscription.trim();
         currentTranscription = '';
+        latestCaptionText = '';
 
         if (!shouldSendTranscription(transcription)) {
             sendToRenderer('update-status', 'Listening...');
